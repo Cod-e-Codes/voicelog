@@ -13,7 +13,5 @@ import "C"
 
 // silenceAlsa suppresses ALSA library error output on Linux to keep the UI clean.
 func silenceAlsa() {
-    C.set_alsa_silent()
+	C.set_alsa_silent()
 }
-
-
