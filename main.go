@@ -2341,6 +2341,8 @@ func (m Model) renderStatusBar() string {
 // Main function
 func main() {
 	setupLogging()
+	// Suppress ALSA stderr spam on Linux so it doesn't leak into the TUI
+	silenceAlsa()
 	log.Printf("Starting voicelog application")
 
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
