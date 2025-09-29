@@ -22,11 +22,13 @@ Audio configuration interface displaying hardware/audio settings, available devi
 ## Features
 
 ### Audio Recording and Playback
-- Record audio using PortAudio
-- Playback with real-time controls
-- WAV file format support
+- Record audio using PortAudio with real-time waveform visualization
+- Playback with real-time controls and waveform display
+- WAV file format support with automatic post-processing
 - Configurable audio devices and settings
 - Test tone generation (440Hz sine wave)
+- Real-time clipping detection with visual warnings
+- Automatic silence trimming and audio normalization
 
 ### Memo Management
 - List view with navigation
@@ -38,10 +40,12 @@ Audio configuration interface displaying hardware/audio settings, available devi
 ### User Interface
 - Terminal user interface using Bubble Tea
 - Keyboard navigation
-- Settings screen for audio configuration
+- Settings screen for audio configuration and processing options
 - Help screen with keybindings
 - ASCII art speaker visualization with two-tone coloring
 - Professional color scheme with rounded borders
+- Adaptive layout with real-time audio visualizer
+- Peak level meters and VU meters during recording
 
 ## Installation
 
@@ -122,11 +126,32 @@ go build -o voicelog main.go
 4. **Test File**: Press `ctrl+t` to generate a 5-second 440Hz test tone
 5. **Export**: Press `e` to export selected memo to Downloads folder
 
+### Audio Processing Features
+
+VoiceLog includes advanced audio processing capabilities:
+
+#### Real-Time Visualization
+- **Waveform Display**: Live waveform visualization during recording and playback
+- **Peak Level Meters**: Monitor input levels with color-coded peak indicators
+- **VU Meters**: Left/right channel level monitoring
+- **Clipping Detection**: Visual warnings when audio levels exceed thresholds
+
+#### Automatic Post-Processing
+- **Silence Trimming**: Automatically removes silence from beginning and end of recordings
+- **Audio Normalization**: Amplifies recordings to optimal levels (configurable target)
+- **Configurable Thresholds**: Adjust silence detection and clipping thresholds in settings
+
+#### Adaptive Interface
+- **Smart Layout**: Interface adapts during recording/playback to show visualizer
+- **Compact Mode**: Memo list becomes compact when audio visualizer is active
+- **Real-Time Updates**: Waveform and meters update in real-time during operation
+
 ## Configuration
 
 Configuration is stored in `~/.voicelog/config.json` and includes:
 - Audio device settings
 - Sample rate and format preferences
+- Audio processing settings (normalization, silence trimming, clipping detection)
 - Memo storage path
 - Keybindings
 
