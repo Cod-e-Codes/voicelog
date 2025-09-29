@@ -5,7 +5,7 @@
 
 A terminal-based voice memo application built with Go and Bubble Tea.
 
-**Current Version: v1.0.7** - Latest release with automated Windows and Linux builds.
+**Current Version: v1.0.8** - Latest release with real-time waveform visualization and audio processing features.
 
 ## Screenshots
 
@@ -53,17 +53,17 @@ Audio configuration interface displaying hardware/audio settings, available devi
 
 Download the latest release from [GitHub Releases](https://github.com/Cod-e-Codes/voicelog/releases):
 
-- **Windows (amd64)**: `voicelog-v1.0.7-windows-amd64.zip`
-- **Linux (amd64)**: `voicelog-v1.0.7-linux-amd64.tar.gz`
+- **Windows (amd64)**: `voicelog-v1.0.8-windows-amd64.zip`
+- **Linux (amd64)**: `voicelog-v1.0.8-linux-amd64.tar.gz`
 
 #### Windows Installation
-1. Download `voicelog-v1.0.7-windows-amd64.zip`
+1. Download `voicelog-v1.0.8-windows-amd64.zip`
 2. Extract the archive
 3. Run `voicelog-windows-amd64.exe`
 
 #### Linux Installation
-1. Download `voicelog-v1.0.7-linux-amd64.tar.gz`
-2. Extract: `tar -xzf voicelog-v1.0.7-linux-amd64.tar.gz`
+1. Download `voicelog-v1.0.8-linux-amd64.tar.gz`
+2. Extract: `tar -xzf voicelog-v1.0.8-linux-amd64.tar.gz`
 3. Install PortAudio: `sudo apt-get install libportaudio2`
 4. Run: `./voicelog-linux-amd64`
 
