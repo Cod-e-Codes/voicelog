@@ -36,6 +36,7 @@ Audio configuration interface displaying hardware/audio settings, available devi
 - Add tags for organization
 - Delete memos
 - Export memos to Downloads folder
+- **Optional transcription** with multiple provider support
 
 ### User Interface
 - Terminal user interface using Bubble Tea
@@ -115,16 +116,18 @@ go build -o voicelog main.go
 | `ctrl+x` | Stop playback |
 | `?` | Show help |
 | `ctrl+s` | Settings |
-| `ctrl+t` | Generate test file |
+| `ctrl+t` | Transcribe selected memo |
+| `F5` | Generate test file |
 | `ESC/q` | Quit |
 
 ### Basic Operations
 
 1. **Recording**: Press `SPACE` to start/stop recording
 2. **Playback**: Select a memo and press `ENTER` to play
-3. **Settings**: Press `ctrl+s` to configure audio devices
-4. **Test File**: Press `ctrl+t` to generate a 5-second 440Hz test tone
-5. **Export**: Press `e` to export selected memo to Downloads folder
+3. **Transcription**: Press `ctrl+t` to transcribe selected memo (optional)
+4. **Settings**: Press `ctrl+s` to configure audio devices and transcription
+5. **Test File**: Press `F5` to generate a 5-second 440Hz test tone
+6. **Export**: Press `ctrl+e` to export selected memo to Downloads folder
 
 ### Audio Processing Features
 
@@ -146,12 +149,86 @@ VoiceLog includes advanced audio processing capabilities:
 - **Compact Mode**: Memo list becomes compact when audio visualizer is active
 - **Real-Time Updates**: Waveform and meters update in real-time during operation
 
+### Transcription (Optional)
+
+VoiceLog supports optional voice-to-text transcription through a flexible plugin system. Transcription is **completely optional** - the application works perfectly without it.
+
+#### Supported Transcription Providers
+
+1. **whisper.cpp (Recommended - Local & Private)**
+   - High accuracy, supports many languages
+   - Runs entirely offline - no internet required
+   - Complete privacy - audio never leaves your machine
+   - Installation: [github.com/ggerganov/whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+
+2. **OpenAI Whisper API (Cloud-based - Highest Accuracy)**
+   - Highest accuracy available
+   - Requires internet connection and API key
+   - Install: `pip install openai`
+   - Set `OPENAI_API_KEY` environment variable
+
+3. **Vosk (Lightweight & Fast)**
+   - Smaller models, faster processing
+   - Good for real-time applications
+   - Installation: [alphacephei.com/vosk](https://alphacephei.com/vosk/)
+
+4. **Custom Python Script**
+   - Use any transcription API (AssemblyAI, Rev.ai, etc.)
+   - Write your own integration script
+   - Full flexibility for custom workflows
+
+#### Quick Setup Examples
+
+**whisper.cpp Setup (Linux/macOS):**
+```bash
+# Clone and build whisper.cpp
+git clone https://github.com/ggerganov/whisper.cpp
+cd whisper.cpp && make
+
+# Download a model (base.en for English, base for multilingual)
+./models/download-ggml-model.sh base.en
+
+# The whisper binary will be auto-detected by VoiceLog
+```
+
+**OpenAI Whisper API Setup:**
+```bash
+# Install the OpenAI library
+pip install openai
+
+# Set your API key (get one from https://platform.openai.com)
+export OPENAI_API_KEY="your-api-key-here"
+```
+
+#### Using Transcription
+
+1. **Enable in Settings**: Press `ctrl+s` → Navigate to "Transcription:" → Toggle to ON
+2. **Select Provider**: Navigate to "Default Provider:" → Choose your installed provider
+3. **Transcribe**: Press `ctrl+t` on any memo to transcribe it
+4. **Auto-Transcribe**: Enable "Auto Transcribe:" to automatically transcribe new recordings
+
+#### Transcription Features
+
+- **Visual Indicators**: Transcribed memos show a 📝 icon in the memo list
+- **Search Integration**: Search through transcribed text using the built-in filter
+- **Provider Status**: Settings show ✓/✗ status for each provider's availability
+- **Flexible Configuration**: Each provider can be configured independently
+- **Auto-Detection**: VoiceLog automatically detects available transcription tools
+
+#### Privacy & Performance
+
+- **Local Options**: whisper.cpp and Vosk run entirely on your machine
+- **Cloud Options**: OpenAI Whisper API provides highest accuracy but requires internet
+- **No Telemetry**: VoiceLog never sends any data anywhere (except when using API providers)
+- **Storage**: Transcriptions are stored locally alongside memo metadata
+
 ## Configuration
 
 Configuration is stored in `~/.voicelog/config.json` and includes:
 - Audio device settings
 - Sample rate and format preferences
 - Audio processing settings (normalization, silence trimming, clipping detection)
+- Transcription settings (optional)
 - Memo storage path
 - Keybindings
 
@@ -159,8 +236,9 @@ Configuration is stored in `~/.voicelog/config.json` and includes:
 ```
 ~/.voicelog/
 ├── config.json          # Application configuration
+├── transcription.json   # Transcription settings (if enabled)
 ├── memos/               # Voice memo storage
-│   ├── metadata.json    # Memo metadata
+│   ├── metadata.json    # Memo metadata (includes transcriptions)
 │   └── memo_*.wav       # Audio files
 └── voicelog.log         # Application logs
 ```

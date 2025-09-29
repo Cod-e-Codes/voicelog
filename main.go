@@ -106,14 +106,15 @@ func (f AudioFormat) Extension() string {
 
 // Memo represents a voice memo with metadata
 type Memo struct {
-	ID       string    `json:"id"`
-	Filename string    `json:"filename"`
-	Name     string    `json:"title"` // Changed from Title to Name to avoid conflict
-	Duration float64   `json:"duration"`
-	Created  time.Time `json:"created"`
-	Size     int64     `json:"size"`
-	Tags     []string  `json:"tags"`
-	Format   string    `json:"format"`
+	ID            string               `json:"id"`
+	Filename      string               `json:"filename"`
+	Name          string               `json:"title"` // Changed from Title to Name to avoid conflict
+	Duration      float64              `json:"duration"`
+	Created       time.Time            `json:"created"`
+	Size          int64                `json:"size"`
+	Tags          []string             `json:"tags"`
+	Format        string               `json:"format"`
+	Transcription *TranscriptionResult `json:"transcription,omitempty"`
 }
 
 // Implement list.Item interface
@@ -128,16 +129,27 @@ func (m Memo) Description() string {
 	if len(m.Tags) > 0 {
 		// Truncate tags if they're too long
 		tagString := strings.Join(m.Tags, ", ")
-		if len(tagString) > 20 {
-			tagString = tagString[:17] + "..."
+		if len(tagString) > 15 { // Reduced to make room for transcription indicator
+			tagString = tagString[:12] + "..."
 		}
 		tags = " [" + tagString + "]"
 	}
-	return fmt.Sprintf("%s, %s%s", duration, size, tags)
+
+	// Add transcription indicator
+	transcriptionStatus := ""
+	if m.Transcription != nil {
+		transcriptionStatus = " 📝"
+	}
+
+	return fmt.Sprintf("%s, %s%s%s", duration, size, tags, transcriptionStatus)
 }
 
 func (m Memo) FilterValue() string {
-	return m.Name + " " + strings.Join(m.Tags, " ")
+	searchText := m.Name + " " + strings.Join(m.Tags, " ")
+	if m.Transcription != nil {
+		searchText += " " + m.Transcription.Text
+	}
+	return searchText
 }
 
 // Truncate text to specified length
@@ -443,6 +455,9 @@ type Model struct {
 	isClipping         bool      // Current clipping status
 	peakLevel          float32   // Current peak level
 
+	// Transcription
+	transcriptionManager *TranscriptionManager
+
 	// UI components
 	textInput textinput.Model
 	help      help.Model
@@ -467,23 +482,24 @@ type Model struct {
 
 // Key bindings
 type keyMap struct {
-	Record   key.Binding
-	Play     key.Binding
-	Stop     key.Binding
-	Delete   key.Binding
-	Rename   key.Binding
-	Tag      key.Binding
-	Export   key.Binding
-	Help     key.Binding
-	Settings key.Binding
-	TestFile key.Binding
-	Quit     key.Binding
-	Up       key.Binding
-	Down     key.Binding
-	Enter    key.Binding
-	Escape   key.Binding
-	Left     key.Binding
-	Right    key.Binding
+	Record     key.Binding
+	Play       key.Binding
+	Stop       key.Binding
+	Delete     key.Binding
+	Rename     key.Binding
+	Tag        key.Binding
+	Export     key.Binding
+	Help       key.Binding
+	Settings   key.Binding
+	TestFile   key.Binding
+	Transcribe key.Binding
+	Quit       key.Binding
+	Up         key.Binding
+	Down       key.Binding
+	Enter      key.Binding
+	Escape     key.Binding
+	Left       key.Binding
+	Right      key.Binding
 }
 
 // ShortHelp returns keybindings to be shown in the mini help view
@@ -494,9 +510,9 @@ func (k keyMap) ShortHelp() []key.Binding {
 // FullHelp returns keybindings for the expanded help view
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Record, k.Play, k.Stop, k.Up, k.Down}, // Core controls
-		{k.Rename, k.Tag, k.Delete, k.Export},    // Management
-		{k.Settings, k.TestFile, k.Help, k.Quit}, // Other
+		{k.Record, k.Play, k.Stop, k.Up, k.Down},               // Core controls
+		{k.Rename, k.Tag, k.Delete, k.Export},                  // Management
+		{k.Transcribe, k.Settings, k.TestFile, k.Help, k.Quit}, // Other
 	}
 }
 
@@ -538,8 +554,12 @@ var keys = keyMap{
 		key.WithHelp("ctrl+s", "settings"),
 	),
 	TestFile: key.NewBinding(
+		key.WithKeys("f5"),
+		key.WithHelp("f5", "test file"),
+	),
+	Transcribe: key.NewBinding(
 		key.WithKeys("ctrl+t"),
-		key.WithHelp("ctrl+t", "test file"),
+		key.WithHelp("ctrl+t", "transcribe"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
@@ -677,6 +697,10 @@ func initialModel() Model {
 	audioAnalyzer := NewAudioAnalyzer(config.SampleRate, config.WaveformSampleRate)
 	clippingDetector := NewClippingDetector(config.ClippingThreshold)
 
+	// Initialize transcription manager
+	homeDir, _ := os.UserHomeDir()
+	transcriptionManager := NewTranscriptionManager(filepath.Join(homeDir, ConfigDir))
+
 	return Model{
 		state:               StateViewing,
 		config:              config,
@@ -693,6 +717,9 @@ func initialModel() Model {
 		audioAnalyzer:    audioAnalyzer,
 		clippingDetector: clippingDetector,
 		realtimeWaveform: make([]float32, config.WaveformSampleRate),
+
+		// Transcription
+		transcriptionManager: transcriptionManager,
 	}
 }
 
@@ -1033,11 +1060,19 @@ func (m Model) handleSettingsKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.Up):
 		if m.settingsSelectedIdx > 0 {
 			m.settingsSelectedIdx--
+			// Skip separator line
+			if m.settingsSelectedIdx == 12 && m.settingsSelectedIdx > 0 {
+				m.settingsSelectedIdx--
+			}
 		}
 
 	case key.Matches(msg, keys.Down):
-		if m.settingsSelectedIdx < 11 { // 12 settings items (0-11)
+		if m.settingsSelectedIdx < 15 { // 16 settings items (0-15) - added transcription settings
 			m.settingsSelectedIdx++
+			// Skip separator line
+			if m.settingsSelectedIdx == 12 && m.settingsSelectedIdx < 15 {
+				m.settingsSelectedIdx++
+			}
 		}
 
 	case key.Matches(msg, keys.Left):
@@ -1232,6 +1267,37 @@ func (m *Model) adjustSetting(delta int) {
 		if m.clippingDetector != nil {
 			m.clippingDetector.threshold = m.config.ClippingThreshold
 		}
+	case 13: // Transcription Enabled
+		enabled := !m.transcriptionManager.GetConfig().Enabled
+		if err := m.transcriptionManager.SetEnabled(enabled); err != nil {
+			log.Printf("Error setting transcription enabled: %v", err)
+		}
+	case 14: // Default Provider
+		providers := m.transcriptionManager.GetAllProviders()
+		currentProvider := m.transcriptionManager.GetConfig().DefaultProvider
+		currentIdx := -1
+		for i, provider := range providers {
+			if provider == currentProvider {
+				currentIdx = i
+				break
+			}
+		}
+		if currentIdx >= 0 {
+			nextIdx := (currentIdx + delta + len(providers)) % len(providers)
+			if err := m.transcriptionManager.SetDefaultProvider(providers[nextIdx]); err != nil {
+				log.Printf("Error setting default provider: %v", err)
+			}
+		} else if len(providers) > 0 {
+			// Set first provider if no current provider
+			if err := m.transcriptionManager.SetDefaultProvider(providers[0]); err != nil {
+				log.Printf("Error setting default provider: %v", err)
+			}
+		}
+	case 15: // Auto Transcribe
+		auto := !m.transcriptionManager.GetConfig().AutoTranscribe
+		if err := m.transcriptionManager.SetAutoTranscribe(auto); err != nil {
+			log.Printf("Error setting auto-transcribe: %v", err)
+		}
 	}
 }
 
@@ -1335,6 +1401,11 @@ func (m Model) handleMainKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.TestFile):
 		m.loadTestFile()
+
+	case key.Matches(msg, keys.Transcribe):
+		if len(m.memos) > 0 {
+			m.transcribeMemo()
+		}
 
 	case key.Matches(msg, keys.Record):
 		if m.recording {
@@ -1726,6 +1797,10 @@ func (m *Model) stopRecording() {
 
 		// Add to memos list
 		m.memos = append([]Memo{memo}, m.memos...)
+
+		// Auto-transcribe if enabled
+		m.autoTranscribeMemo(&memo)
+
 		// Refresh list items to include the new memo
 		m.memoList.SetItems(convertMemosToListItems(m.memos))
 
@@ -2056,8 +2131,13 @@ func (m Model) renderSettings() string {
 		"Auto Trim Silence:",
 		"Silence Threshold:",
 		"Clipping Threshold:",
+		"", // Separator
+		"Transcription:",
+		"Default Provider:",
+		"Auto Transcribe:",
 	}
 
+	transcriptionConfig := m.transcriptionManager.GetConfig()
 	values := []string{
 		m.getDeviceName(m.config.InputDevice),
 		m.getDeviceName(m.config.OutputDevice),
@@ -2071,10 +2151,20 @@ func (m Model) renderSettings() string {
 		boolToString(m.config.AutoTrimSilence),
 		fmt.Sprintf("%.1f%%", m.config.SilenceThreshold*100),
 		fmt.Sprintf("%.0f%%", m.config.ClippingThreshold*100),
+		"", // Separator value
+		boolToString(transcriptionConfig.Enabled),
+		m.getTranscriptionProviderDisplay(transcriptionConfig.DefaultProvider),
+		boolToString(transcriptionConfig.AutoTranscribe),
 	}
 
 	var lines []string
 	for i, setting := range settings {
+		// Skip empty separator settings
+		if setting == "" && i == 12 {
+			lines = append(lines, "")
+			continue
+		}
+
 		var line string
 		if i == m.settingsSelectedIdx {
 			line += selectedStyle.Render("▶ ")
@@ -2086,8 +2176,8 @@ func (m Model) renderSettings() string {
 		line += " "
 		line += successStyle.Render(values[i])
 
-		// Add arrows for navigation
-		if i == m.settingsSelectedIdx {
+		// Add arrows for navigation (skip separator)
+		if i == m.settingsSelectedIdx && i != 12 {
 			line += " " + mutedStyle.Render("← →")
 		}
 
@@ -2130,6 +2220,50 @@ func (m Model) getDeviceName(deviceID string) string {
 		}
 	}
 	return fmt.Sprintf("Unknown Device (ID: %s)", deviceID)
+}
+
+// Get transcription provider display name
+func (m Model) getTranscriptionProviderDisplay(providerName string) string {
+	if providerName == "" {
+		return "None"
+	}
+
+	available := m.transcriptionManager.GetAvailableProviders()
+	isAvailable := false
+	for _, name := range available {
+		if name == providerName {
+			isAvailable = true
+			break
+		}
+	}
+
+	if isAvailable {
+		switch providerName {
+		case "whisper.cpp":
+			return "Whisper.cpp ✓"
+		case "vosk":
+			return "Vosk ✓"
+		case "openai_whisper":
+			return "OpenAI Whisper ✓"
+		case "python_script":
+			return "Custom Script ✓"
+		default:
+			return providerName + " ✓"
+		}
+	} else {
+		switch providerName {
+		case "whisper.cpp":
+			return "Whisper.cpp ✗"
+		case "vosk":
+			return "Vosk ✗"
+		case "openai_whisper":
+			return "OpenAI Whisper ✗"
+		case "python_script":
+			return "Custom Script ✗"
+		default:
+			return providerName + " ✗"
+		}
+	}
 }
 
 // Get system audio info
@@ -2941,6 +3075,95 @@ func renderPeakBar(level float32, width int) string {
 	}
 
 	return bar
+}
+
+// Transcribe the currently selected memo
+func (m *Model) transcribeMemo() {
+	if len(m.memos) == 0 {
+		m.showNotification("No memo selected")
+		return
+	}
+
+	memo := &m.memos[m.selectedIdx]
+	if memo.Transcription != nil {
+		m.showNotification("Memo already transcribed")
+		return
+	}
+
+	if !m.transcriptionManager.GetConfig().Enabled {
+		m.showNotification("Transcription is disabled - enable in settings")
+		return
+	}
+
+	filePath := filepath.Join(m.config.MemosPath, memo.Filename)
+
+	// Check if file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		m.showNotification("Audio file not found")
+		return
+	}
+
+	m.showNotification("Transcribing...")
+
+	// Run transcription in background (simplified for TUI)
+	result, err := m.transcriptionManager.Transcribe(filePath, "")
+	if err != nil {
+		m.showNotification(fmt.Sprintf("Transcription failed: %v", err))
+		return
+	}
+
+	// Store transcription result in memo
+	result.MemoID = memo.ID
+	memo.Transcription = result
+
+	// Update the memo in the list
+	for i := range m.memos {
+		if m.memos[i].ID == memo.ID {
+			m.memos[i].Transcription = result
+			break
+		}
+	}
+
+	// Save metadata
+	if err := saveMemos(m.memos, m.config.MemosPath); err != nil {
+		log.Printf("Error saving memos metadata: %v", err)
+		m.showNotification("Error saving transcription")
+	} else {
+		m.showNotification("Transcription completed!")
+	}
+
+	// Refresh list items
+	m.memoList.SetItems(convertMemosToListItems(m.memos))
+}
+
+// Auto-transcribe a memo if enabled
+func (m *Model) autoTranscribeMemo(memo *Memo) {
+	if !m.transcriptionManager.GetConfig().Enabled || !m.transcriptionManager.GetConfig().AutoTranscribe {
+		return
+	}
+
+	if memo.Transcription != nil {
+		return // Already transcribed
+	}
+
+	filePath := filepath.Join(m.config.MemosPath, memo.Filename)
+
+	// Run transcription in background
+	go func() {
+		result, err := m.transcriptionManager.Transcribe(filePath, "")
+		if err != nil {
+			log.Printf("Auto-transcription failed: %v", err)
+			return
+		}
+
+		result.MemoID = memo.ID
+		memo.Transcription = result
+
+		// Update metadata
+		if err := saveMemos(m.memos, m.config.MemosPath); err != nil {
+			log.Printf("Error saving auto-transcription: %v", err)
+		}
+	}()
 }
 
 // Main function
