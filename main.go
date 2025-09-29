@@ -435,15 +435,13 @@ type Model struct {
 	vuMeter  VUMeterData
 
 	// Real-time audio analysis
-	audioAnalyzer       *AudioAnalyzer
-	clippingDetector    *ClippingDetector
-	realtimeWaveform    []float32 // Downsampled waveform for display
-	playbackWaveform    []float32 // Waveform data for playback visualization
-	playbackSampleRate  int       // Sample rate of current playback file
-	isClipping          bool      // Current clipping status
-	clippingFlash       int       // Flash counter for clipping indicator
-	audioAnalysisBuffer []int16   // Rolling buffer for waveform analysis
-	peakLevel           float32   // Current peak level
+	audioAnalyzer      *AudioAnalyzer
+	clippingDetector   *ClippingDetector
+	realtimeWaveform   []float32 // Downsampled waveform for display
+	playbackWaveform   []float32 // Waveform data for playback visualization
+	playbackSampleRate int       // Sample rate of current playback file
+	isClipping         bool      // Current clipping status
+	peakLevel          float32   // Current peak level
 
 	// UI components
 	textInput textinput.Model

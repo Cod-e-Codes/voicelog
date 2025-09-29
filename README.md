@@ -45,7 +45,7 @@ Audio configuration interface displaying hardware/audio settings, available devi
 - ASCII art speaker visualization with two-tone coloring
 - Professional color scheme with rounded borders
 - Adaptive layout with real-time audio visualizer
-- Peak level meters and VU meters during recording
+- Real-time peak level meters and VU meters during recording
 
 ## Installation
 
@@ -132,9 +132,9 @@ VoiceLog includes advanced audio processing capabilities:
 
 #### Real-Time Visualization
 - **Waveform Display**: Live waveform visualization during recording and playback
-- **Peak Level Meters**: Monitor input levels with color-coded peak indicators
-- **VU Meters**: Left/right channel level monitoring
-- **Clipping Detection**: Visual warnings when audio levels exceed thresholds
+- **Peak Level Meters**: Monitor input levels with color-coded peak indicators (during recording)
+- **VU Meters**: Left/right channel level monitoring (during recording)
+- **Clipping Detection**: Visual warnings when audio levels exceed thresholds (during recording)
 
 #### Automatic Post-Processing
 - **Silence Trimming**: Automatically removes silence from beginning and end of recordings
