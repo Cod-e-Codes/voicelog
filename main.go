@@ -191,6 +191,14 @@ type Config struct {
 	ChannelCount  int               `json:"channel_count"`
 	Volume        float64           `json:"volume"`
 	AudioDevices  []AudioDeviceInfo `json:"audio_devices"`
+
+	// Audio processing settings
+	AutoNormalize      bool    `json:"auto_normalize"`
+	NormalizeTarget    float64 `json:"normalize_target"`  // Target peak level (0.0-1.0)
+	SilenceThreshold   float64 `json:"silence_threshold"` // RMS threshold for silence detection
+	AutoTrimSilence    bool    `json:"auto_trim_silence"`
+	ClippingThreshold  float64 `json:"clipping_threshold"`   // Threshold for clipping detection (0.95-1.0)
+	WaveformSampleRate int     `json:"waveform_sample_rate"` // Samples to display in waveform
 }
 
 // Keybindings holds custom key configurations
@@ -352,6 +360,14 @@ func defaultConfig() Config {
 			Quit:   "q",
 		},
 		AudioDevices: []AudioDeviceInfo{}, // Empty initially, will be populated when needed
+
+		// Audio processing defaults
+		AutoNormalize:      true,
+		NormalizeTarget:    0.95, // 95% of max amplitude
+		SilenceThreshold:   0.01, // 1% of max amplitude
+		AutoTrimSilence:    true,
+		ClippingThreshold:  0.95,
+		WaveformSampleRate: 100, // 100 points for display
 	}
 }
 
@@ -375,6 +391,30 @@ type VUMeterData struct {
 	rightLevel float32
 }
 
+// AudioAnalyzer handles real-time audio analysis for visualization
+type AudioAnalyzer struct {
+	buffer          []int16 // Circular buffer for incoming samples
+	bufferSize      int     // Size of the buffer
+	writePos        int     // Current write position
+	downsampleRatio int     // Ratio for downsampling
+	waveformPoints  int     // Number of points to display
+}
+
+// AudioProcessor handles post-recording audio processing
+type AudioProcessor struct {
+	SilenceThreshold float64
+	NormalizeTarget  float64
+}
+
+// ClippingDetector monitors audio for clipping in real-time
+type ClippingDetector struct {
+	threshold    float64
+	isClipping   bool
+	clipCount    int
+	totalSamples int
+	flashCounter int
+}
+
 // Model represents the application state
 type Model struct {
 	// Core state
@@ -393,6 +433,17 @@ type Model struct {
 	// Visualization data
 	waveform WaveformData
 	vuMeter  VUMeterData
+
+	// Real-time audio analysis
+	audioAnalyzer       *AudioAnalyzer
+	clippingDetector    *ClippingDetector
+	realtimeWaveform    []float32 // Downsampled waveform for display
+	playbackWaveform    []float32 // Waveform data for playback visualization
+	playbackSampleRate  int       // Sample rate of current playback file
+	isClipping          bool      // Current clipping status
+	clippingFlash       int       // Flash counter for clipping indicator
+	audioAnalysisBuffer []int16   // Rolling buffer for waveform analysis
+	peakLevel           float32   // Current peak level
 
 	// UI components
 	textInput textinput.Model
@@ -624,6 +675,10 @@ func initialModel() Model {
 	memoList.SetFilteringEnabled(false) // Disable filtering
 	memoList.SetItems(convertMemosToListItems(memos))
 
+	// Initialize audio processing components
+	audioAnalyzer := NewAudioAnalyzer(config.SampleRate, config.WaveformSampleRate)
+	clippingDetector := NewClippingDetector(config.ClippingThreshold)
+
 	return Model{
 		state:               StateViewing,
 		config:              config,
@@ -635,6 +690,11 @@ func initialModel() Model {
 		help:                h,
 		memoList:            memoList,
 		lastUpdate:          time.Now(),
+
+		// Audio processing
+		audioAnalyzer:    audioAnalyzer,
+		clippingDetector: clippingDetector,
+		realtimeWaveform: make([]float32, config.WaveformSampleRate),
 	}
 }
 
@@ -684,6 +744,20 @@ func loadConfig() Config {
 	}
 	if config.Volume <= 0.0 || config.Volume > 1.0 {
 		config.Volume = 1.0
+	}
+
+	// Ensure audio processing settings have valid values
+	if config.WaveformSampleRate <= 0 {
+		config.WaveformSampleRate = 100
+	}
+	if config.NormalizeTarget <= 0.0 || config.NormalizeTarget > 1.0 {
+		config.NormalizeTarget = 0.95
+	}
+	if config.SilenceThreshold <= 0.0 {
+		config.SilenceThreshold = 0.01
+	}
+	if config.ClippingThreshold <= 0.0 || config.ClippingThreshold > 1.0 {
+		config.ClippingThreshold = 0.95
 	}
 
 	return config
@@ -849,6 +923,13 @@ func min(a, b int) int {
 	return b
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // Tea program messages
 type tickMsg time.Time
 type recordingTickMsg time.Time
@@ -898,14 +979,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.recording {
 			m.recordingTime = now.Sub(m.lastUpdate) + m.recordingTime
 			m.recordingPulse = (m.recordingPulse + 1) % 20
+			// Update clipping flash counter
+			if m.clippingDetector != nil {
+				m.clippingDetector.UpdateFlash()
+			}
 		}
 		if m.playing {
 			// Update playback position based on real audio data
 			if m.audioDevice != nil && m.audioDevice.playbackData != nil {
-				// Calculate position based on samples played
-				samplesPerSecond := 44100 // Default sample rate
-				// Estimate position based on playback position in samples
-				m.playbackPos = time.Duration(float64(m.audioDevice.playbackPos) / float64(samplesPerSecond) * float64(time.Second))
+				// Use the stored sample rate from when playback started
+				sampleRate := m.playbackSampleRate
+				if sampleRate == 0 {
+					sampleRate = 44100 // Fallback to default sample rate
+				}
+
+				// Calculate position based on samples played and actual sample rate
+				m.playbackPos = time.Duration(float64(m.audioDevice.playbackPos) / float64(sampleRate) * float64(time.Second))
 
 				// Check if we've reached the end of the audio data
 				if m.audioDevice.playbackPos >= len(m.audioDevice.playbackData) {
@@ -949,7 +1038,7 @@ func (m Model) handleSettingsKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case key.Matches(msg, keys.Down):
-		if m.settingsSelectedIdx < 6 { // 7 settings items (0-6)
+		if m.settingsSelectedIdx < 11 { // 12 settings items (0-11)
 			m.settingsSelectedIdx++
 		}
 
@@ -1116,6 +1205,35 @@ func (m *Model) adjustSetting(delta int) {
 			newVolume = 1.0
 		}
 		m.setPlayerVolume(newVolume)
+	case 7: // Auto Normalize
+		m.config.AutoNormalize = !m.config.AutoNormalize
+	case 8: // Normalize Target
+		m.config.NormalizeTarget += float64(delta) * 0.05
+		if m.config.NormalizeTarget < 0.5 {
+			m.config.NormalizeTarget = 0.5
+		} else if m.config.NormalizeTarget > 1.0 {
+			m.config.NormalizeTarget = 1.0
+		}
+	case 9: // Auto Trim Silence
+		m.config.AutoTrimSilence = !m.config.AutoTrimSilence
+	case 10: // Silence Threshold
+		m.config.SilenceThreshold += float64(delta) * 0.005
+		if m.config.SilenceThreshold < 0.001 {
+			m.config.SilenceThreshold = 0.001
+		} else if m.config.SilenceThreshold > 0.1 {
+			m.config.SilenceThreshold = 0.1
+		}
+	case 11: // Clipping Threshold
+		m.config.ClippingThreshold += float64(delta) * 0.05
+		if m.config.ClippingThreshold < 0.8 {
+			m.config.ClippingThreshold = 0.8
+		} else if m.config.ClippingThreshold > 1.0 {
+			m.config.ClippingThreshold = 1.0
+		}
+		// Update the clipping detector threshold
+		if m.clippingDetector != nil {
+			m.clippingDetector.threshold = m.config.ClippingThreshold
+		}
 	}
 }
 
@@ -1423,49 +1541,23 @@ func (m *Model) startRecording() {
 
 // Process audio input callback
 func (m *Model) processAudioInput(in []int16) {
-	// Debug: Check if we're getting any audio data
-	if len(in) > 0 {
-		// Check for non-zero samples (actual audio)
-		hasAudio := false
-		for _, sample := range in {
-			if sample != 0 {
-				hasAudio = true
-				break
-			}
-		}
-
-		// Log first few samples for debugging
-		if len(in) >= 4 {
-			log.Printf("Audio samples: [%d, %d, %d, %d] (hasAudio: %v)",
-				in[0], in[1], in[2], in[3], hasAudio)
-		}
-	}
-
-	// Write audio data to file
+	// Write audio data to file (existing functionality)
 	if m.audioDevice != nil && m.audioDevice.recordingFile != nil {
 		if err := binary.Write(m.audioDevice.recordingFile, binary.LittleEndian, in); err != nil {
 			log.Printf("Error writing audio data: %v", err)
 		}
 	}
 
-	// Update waveform visualization
-	if len(in) > 0 {
-		samples := make([]float32, len(in))
-		var max float32
-		for i, sample := range in {
-			// Convert int16 to float32 (-1.0 to 1.0)
-			val := float32(sample) / 32768.0
-			samples[i] = val
-			if val < 0 {
-				val = -val
-			}
-			if val > max {
-				max = val
-			}
-		}
-		m.waveform = WaveformData{samples: samples, max: max}
+	// NEW: Real-time waveform and clipping detection
+	if m.audioAnalyzer != nil && m.clippingDetector != nil && len(in) > 0 {
+		waveform, peak, _ := m.audioAnalyzer.ProcessSamples(in)
+		m.realtimeWaveform = waveform
+		m.peakLevel = peak
 
-		// Update VU meter (simplified - use first few samples)
+		m.clippingDetector.Analyze(in)
+		m.isClipping = m.clippingDetector.IsClipping()
+
+		// Update VU meter with real data
 		if len(in) >= 2 {
 			leftLevel := float32(in[0]) / 32768.0
 			rightLevel := float32(in[1]) / 32768.0
@@ -1480,6 +1572,23 @@ func (m *Model) processAudioInput(in []int16) {
 				rightLevel: rightLevel,
 			}
 		}
+	}
+
+	// Legacy fallback for old waveform (kept for compatibility)
+	if len(in) > 0 {
+		samples := make([]float32, min(100, len(in)))
+		var max float32
+		for i := 0; i < len(samples) && i < len(in); i++ {
+			val := float32(in[i]) / 32768.0
+			samples[i] = val
+			if val < 0 {
+				val = -val
+			}
+			if val > max {
+				max = val
+			}
+		}
+		m.waveform = WaveformData{samples: samples, max: max}
 	}
 }
 
@@ -1580,6 +1689,32 @@ func (m *Model) stopRecording() {
 
 	// Create new memo with real data
 	if filename != "" {
+		// NEW: Apply post-processing
+		filePath := filepath.Join(m.config.MemosPath, filename)
+		processor := NewAudioProcessor(m.config.SilenceThreshold, m.config.NormalizeTarget)
+
+		if err := processor.ProcessRecording(
+			filePath,
+			m.config.AutoTrimSilence,
+			m.config.AutoNormalize,
+		); err != nil {
+			log.Printf("Error processing recording: %v", err)
+		} else {
+			log.Printf("Post-processing completed successfully")
+
+			// Update file size after processing
+			if info, err := os.Stat(filePath); err == nil {
+				fileSize = info.Size()
+
+				// Recalculate duration after processing
+				if samples, sampleRate, channels, err := readWAVData(filePath); err == nil {
+					if sampleRate > 0 {
+						duration = float64(len(samples)) / float64(sampleRate) / float64(channels)
+					}
+				}
+			}
+		}
+
 		memo := Memo{
 			ID:       fmt.Sprintf("%d", time.Now().Unix()),
 			Filename: filename,
@@ -1599,6 +1734,11 @@ func (m *Model) stopRecording() {
 		// Save metadata
 		if err := saveMemos(m.memos, m.config.MemosPath); err != nil {
 			log.Printf("Error saving memos metadata: %v", err)
+		}
+
+		// Reset clipping detector for next recording
+		if m.clippingDetector != nil {
+			m.clippingDetector.Reset()
 		}
 	}
 
@@ -1624,6 +1764,14 @@ func (m *Model) startPlayback() {
 		log.Printf("Error reading audio file: %v", err)
 		return
 	}
+
+	// Generate waveform data for playback visualization
+	playbackAnalyzer := NewAudioAnalyzer(sampleRate, m.config.WaveformSampleRate)
+	waveform, peak, _ := playbackAnalyzer.ProcessSamples(audioData)
+	m.playbackWaveform = waveform
+	m.playbackSampleRate = sampleRate
+	m.peakLevel = peak
+	log.Printf("Generated playback waveform: %d points, peak level: %.3f, sample rate: %d", len(waveform), peak, sampleRate)
 
 	// Initialize PortAudio
 	if err := portaudio.Initialize(); err != nil {
@@ -1726,6 +1874,8 @@ func (m *Model) stopPlayback() {
 	m.playing = false
 	m.state = StateViewing
 	m.playbackPos = 0
+	m.playbackWaveform = nil // Clear waveform data
+	m.playbackSampleRate = 0 // Clear sample rate
 
 	log.Printf("Playback stopped")
 }
@@ -1903,6 +2053,11 @@ func (m Model) renderSettings() string {
 		"Channels:",
 		"Audio Format:",
 		"Volume:",
+		"Auto Normalize:",
+		"Normalize Target:",
+		"Auto Trim Silence:",
+		"Silence Threshold:",
+		"Clipping Threshold:",
 	}
 
 	values := []string{
@@ -1913,6 +2068,11 @@ func (m Model) renderSettings() string {
 		fmt.Sprintf("%d", m.config.ChannelCount),
 		m.config.DefaultFormat.String(),
 		fmt.Sprintf("%.0f%%", m.getPlayerVolume()*100),
+		boolToString(m.config.AutoNormalize),
+		fmt.Sprintf("%.0f%%", m.config.NormalizeTarget*100),
+		boolToString(m.config.AutoTrimSilence),
+		fmt.Sprintf("%.1f%%", m.config.SilenceThreshold*100),
+		fmt.Sprintf("%.0f%%", m.config.ClippingThreshold*100),
 	}
 
 	var lines []string
@@ -2002,13 +2162,17 @@ func (m Model) renderMain() string {
 	// Header
 	sections = append(sections, m.renderHeader())
 
-	// Waveform/VU meters section
-	if m.recording || m.playing {
-		sections = append(sections, m.renderAudioVisualizer())
-	}
+	// Check if we need to show audio visualizer
+	showingVisualizer := m.recording || m.playing
 
-	// Main content area with memo list and speaker art
-	sections = append(sections, m.renderMainContent())
+	if showingVisualizer {
+		// When recording/playing, show visualizer and compact main content
+		sections = append(sections, m.renderAudioVisualizer())
+		sections = append(sections, m.renderCompactMainContent())
+	} else {
+		// Normal view with full main content (memo list + speaker art)
+		sections = append(sections, m.renderMainContent())
+	}
 
 	// Text input (for renaming/tagging)
 	if m.state == StateRenaming || m.state == StateTagging {
@@ -2055,13 +2219,16 @@ func (m Model) renderAudioVisualizer() string {
 	var lines []string
 
 	if m.recording {
-		// Waveform
+		// NEW: Use real-time waveform
 		waveformLine := "Waveform: "
-		for _, sample := range m.waveform.samples[:min(50, len(m.waveform.samples))] {
-			height := int((sample + 1) * 5)
-			if height < 0 {
-				height = 0
-			}
+		displaySamples := m.realtimeWaveform
+		if len(displaySamples) == 0 && len(m.waveform.samples) > 0 {
+			// Fallback to legacy waveform
+			displaySamples = m.waveform.samples[:min(50, len(m.waveform.samples))]
+		}
+
+		for _, amplitude := range displaySamples {
+			height := int(amplitude * 10)
 			if height > 10 {
 				height = 10
 			}
@@ -2080,7 +2247,28 @@ func (m Model) renderAudioVisualizer() string {
 		}
 		lines = append(lines, waveformStyle.Render(waveformLine))
 
-		// VU Meters
+		// NEW: Peak level indicator
+		if m.peakLevel > 0 {
+			peakBar := fmt.Sprintf("Peak: [%s] %.1f%%",
+				renderPeakBar(m.peakLevel, 20),
+				m.peakLevel*100)
+			lines = append(lines, normalStyle.Render(peakBar))
+		}
+
+		// NEW: Clipping indicator
+		if m.isClipping && m.clippingDetector != nil {
+			clipWarning := "⚠ CLIPPING DETECTED ⚠"
+			// Flash effect
+			if m.clippingDetector.flashCounter%4 < 2 {
+				lines = append(lines,
+					lipgloss.NewStyle().
+						Foreground(lipgloss.Color("#FF0000")).
+						Bold(true).
+						Render(clipWarning))
+			}
+		}
+
+		// VU Meters (existing)
 		leftMeter := renderVUMeter("L", m.vuMeter.leftLevel)
 		rightMeter := renderVUMeter("R", m.vuMeter.rightLevel)
 		lines = append(lines, vuMeterStyle.Render(leftMeter))
@@ -2088,6 +2276,49 @@ func (m Model) renderAudioVisualizer() string {
 	}
 
 	if m.playing && len(m.memos) > 0 {
+		// Render playback waveform
+		waveformLine := "Waveform: "
+		displaySamples := m.playbackWaveform
+		if len(displaySamples) == 0 {
+			waveformLine += "No waveform data"
+		} else {
+			// Calculate the portion of the waveform to display based on playback position
+			memo := m.memos[m.selectedIdx]
+			progress := m.playbackPos.Seconds() / memo.Duration
+			if progress > 1 {
+				progress = 1
+			}
+
+			windowSize := min(50, len(displaySamples)) // Display up to 50 points
+			startIdx := int(progress * float64(max(0, len(displaySamples)-windowSize)))
+			if startIdx < 0 {
+				startIdx = 0
+			}
+			endIdx := startIdx + windowSize
+			if endIdx > len(displaySamples) {
+				endIdx = len(displaySamples)
+			}
+
+			for _, amplitude := range displaySamples[startIdx:endIdx] {
+				height := int(amplitude * 10)
+				if height > 10 {
+					height = 10
+				}
+				if height > 7 {
+					waveformLine += "█"
+				} else if height > 5 {
+					waveformLine += "▆"
+				} else if height > 3 {
+					waveformLine += "▄"
+				} else if height > 1 {
+					waveformLine += "▂"
+				} else {
+					waveformLine += "·"
+				}
+			}
+		}
+		lines = append(lines, waveformStyle.Render(waveformLine))
+
 		// Timeline scrubber
 		memo := m.memos[m.selectedIdx]
 		progress := m.playbackPos.Seconds() / memo.Duration
@@ -2105,10 +2336,7 @@ func (m Model) renderAudioVisualizer() string {
 	}
 
 	if len(lines) > 0 {
-		lines = append([]string{""}, lines...)
-		lines = append(lines, "")
-
-		// Apply border to audio visualizer
+		// More compact - no extra spacing
 		visualizerContent := lipgloss.JoinVertical(lipgloss.Left, lines...)
 		return borderStyle.Render(visualizerContent)
 	}
@@ -2190,8 +2418,12 @@ func (m Model) renderMainContent() string {
 		emptyList.Title = "MEMOS"
 		emptyList.Styles.Title = titleStyle
 		emptyList.SetShowHelp(false)
-		emptyList.SetSize(fixedListWidth, m.height-15) // Reserve more space for help
-		emptyList.SetFilteringEnabled(false)           // Disable filtering
+		listHeight := m.height - 15 // Reserve space for header, status, and help
+		if listHeight < 10 {
+			listHeight = 10 // Minimum height
+		}
+		emptyList.SetSize(fixedListWidth, listHeight)
+		emptyList.SetFilteringEnabled(false) // Disable filtering
 
 		// Add a placeholder item
 		placeholderItem := list.Item(placeholderMemo{})
@@ -2201,9 +2433,13 @@ func (m Model) renderMainContent() string {
 		emptyList.SetShowStatusBar(false) // Hide the status bar that shows item count
 		memoListContent = memoListBorderStyle.Render(emptyList.View())
 	} else {
-		// Do not reset items every render; only size and view
-		m.memoList.SetSize(fixedListWidth, m.height-15) // Reserve more space for help
-		m.memoList.SetShowStatusBar(true)               // Show status bar for real items
+		// Set full size for normal view
+		listHeight := m.height - 15 // Reserve space for header, status, and help
+		if listHeight < 10 {
+			listHeight = 10 // Minimum height
+		}
+		m.memoList.SetSize(fixedListWidth, listHeight)
+		m.memoList.SetShowStatusBar(true) // Show status bar for real items
 		memoListContent = memoListBorderStyle.Render(m.memoList.View())
 	}
 
@@ -2215,6 +2451,37 @@ func (m Model) renderMainContent() string {
 
 	// Combine memo list and speaker art horizontally (memo list on left, speaker on right)
 	return lipgloss.JoinHorizontal(lipgloss.Top, memoListContent, "    ", speakerArtWithSpacing)
+}
+
+// Render compact main content for when visualizer is active
+func (m Model) renderCompactMainContent() string {
+	// Show only the memo list without the ASCII art to save space
+	var memoListContent string
+	fixedListWidth := 60 // Wider list when no ASCII art
+
+	if len(m.memos) == 0 {
+		// Create empty list with placeholder message
+		emptyList := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
+		emptyList.Title = "MEMOS"
+		emptyList.Styles.Title = titleStyle
+		emptyList.SetShowHelp(false)
+		emptyList.SetSize(fixedListWidth, 8) // Shorter height to save vertical space
+		emptyList.SetFilteringEnabled(false)
+
+		// Add a placeholder item
+		placeholderItem := list.Item(placeholderMemo{})
+		emptyList.SetItems([]list.Item{placeholderItem})
+
+		emptyList.SetShowStatusBar(false)
+		memoListContent = memoListBorderStyle.Render(emptyList.View())
+	} else {
+		// Use existing memo list but with compact sizing
+		m.memoList.SetSize(fixedListWidth, 8) // Shorter height
+		m.memoList.SetShowStatusBar(true)
+		memoListContent = memoListBorderStyle.Render(m.memoList.View())
+	}
+
+	return memoListContent
 }
 
 // Render two-tone speaker ASCII art
@@ -2338,11 +2605,349 @@ func (m Model) renderStatusBar() string {
 	return statusBar
 }
 
+// ============================================================================
+// AUDIO PROCESSING IMPLEMENTATIONS
+// ============================================================================
+
+// NewAudioAnalyzer creates a new audio analyzer
+func NewAudioAnalyzer(sampleRate, waveformPoints int) *AudioAnalyzer {
+	// Validate inputs to prevent divide by zero
+	if sampleRate <= 0 {
+		sampleRate = SampleRate // Use default sample rate
+	}
+	if waveformPoints <= 0 {
+		waveformPoints = 100 // Use default waveform points
+	}
+
+	// Buffer size: 1 second of audio
+	bufferSize := sampleRate * 2 // Stereo
+	downsampleRatio := bufferSize / waveformPoints
+	if downsampleRatio < 1 {
+		downsampleRatio = 1
+	}
+
+	log.Printf("AudioAnalyzer initialized: sampleRate=%d, waveformPoints=%d, bufferSize=%d, downsampleRatio=%d",
+		sampleRate, waveformPoints, bufferSize, downsampleRatio)
+
+	return &AudioAnalyzer{
+		buffer:          make([]int16, bufferSize),
+		bufferSize:      bufferSize,
+		writePos:        0,
+		downsampleRatio: downsampleRatio,
+		waveformPoints:  waveformPoints,
+	}
+}
+
+// ProcessSamples processes incoming audio samples and returns waveform data
+func (a *AudioAnalyzer) ProcessSamples(samples []int16) (waveform []float32, peak float32, isClipping bool) {
+	waveform = make([]float32, a.waveformPoints)
+	peak = 0.0
+	isClipping = false
+
+	// Add samples to circular buffer
+	for _, sample := range samples {
+		a.buffer[a.writePos] = sample
+		a.writePos = (a.writePos + 1) % a.bufferSize
+
+		// Check for clipping
+		absSample := math.Abs(float64(sample)) / 32768.0
+		if absSample > float64(peak) {
+			peak = float32(absSample)
+		}
+		if absSample >= 0.95 {
+			isClipping = true
+		}
+	}
+
+	// Downsample buffer to create waveform visualization
+	for i := 0; i < a.waveformPoints; i++ {
+		startIdx := i * a.downsampleRatio
+		endIdx := startIdx + a.downsampleRatio
+
+		// Calculate RMS for this segment
+		var sumSquares float64
+		count := 0
+
+		for j := startIdx; j < endIdx && j < a.bufferSize; j++ {
+			idx := (a.writePos + j) % a.bufferSize
+			normalized := float64(a.buffer[idx]) / 32768.0
+			sumSquares += normalized * normalized
+			count++
+		}
+
+		if count > 0 {
+			rms := math.Sqrt(sumSquares / float64(count))
+			waveform[i] = float32(rms)
+		}
+	}
+
+	return waveform, peak, isClipping
+}
+
+// NewAudioProcessor creates a new audio processor
+func NewAudioProcessor(silenceThreshold, normalizeTarget float64) *AudioProcessor {
+	return &AudioProcessor{
+		SilenceThreshold: silenceThreshold,
+		NormalizeTarget:  normalizeTarget,
+	}
+}
+
+// TrimSilence removes silence from the beginning and end of audio data
+func (ap *AudioProcessor) TrimSilence(samples []int16, sampleRate, channels int) []int16 {
+	if len(samples) == 0 {
+		return samples
+	}
+
+	frameSize := channels
+	numFrames := len(samples) / frameSize
+
+	// Find start of non-silent audio
+	startFrame := 0
+	for i := 0; i < numFrames; i++ {
+		frameStart := i * frameSize
+		frameEnd := frameStart + frameSize
+		if frameEnd > len(samples) {
+			break
+		}
+
+		if ap.isFrameSilent(samples[frameStart:frameEnd]) {
+			startFrame = i + 1
+		} else {
+			break
+		}
+	}
+
+	// Find end of non-silent audio
+	endFrame := numFrames
+	for i := numFrames - 1; i >= startFrame; i-- {
+		frameStart := i * frameSize
+		frameEnd := frameStart + frameSize
+		if frameEnd > len(samples) {
+			continue
+		}
+
+		if ap.isFrameSilent(samples[frameStart:frameEnd]) {
+			endFrame = i
+		} else {
+			break
+		}
+	}
+
+	// Extract non-silent portion
+	if startFrame >= endFrame {
+		// Entire audio is silent, return small buffer
+		return samples[:min(frameSize*10, len(samples))]
+	}
+
+	startSample := startFrame * frameSize
+	endSample := endFrame * frameSize
+
+	log.Printf("Trimmed silence: start=%d, end=%d (total=%d frames)",
+		startFrame, endFrame, numFrames)
+
+	return samples[startSample:endSample]
+}
+
+// isFrameSilent checks if an audio frame is below the silence threshold
+func (ap *AudioProcessor) isFrameSilent(frame []int16) bool {
+	var sumSquares float64
+
+	for _, sample := range frame {
+		normalized := float64(sample) / 32768.0
+		sumSquares += normalized * normalized
+	}
+
+	rms := math.Sqrt(sumSquares / float64(len(frame)))
+	return rms < ap.SilenceThreshold
+}
+
+// Normalize adjusts audio amplitude to reach target peak level
+func (ap *AudioProcessor) Normalize(samples []int16) []int16 {
+	if len(samples) == 0 {
+		return samples
+	}
+
+	// Find current peak
+	var maxAbs int16
+	for _, sample := range samples {
+		abs := sample
+		if abs < 0 {
+			abs = -abs
+		}
+		if abs > maxAbs {
+			maxAbs = abs
+		}
+	}
+
+	if maxAbs == 0 {
+		return samples
+	}
+
+	// Calculate gain to reach target
+	currentPeak := float64(maxAbs) / 32768.0
+	targetPeak := ap.NormalizeTarget
+	gain := targetPeak / currentPeak
+
+	// Don't amplify if already at or above target
+	if gain <= 1.0 {
+		log.Printf("Audio already normalized (peak=%.2f)", currentPeak)
+		return samples
+	}
+
+	log.Printf("Normalizing audio: gain=%.2fx (peak %.2f -> %.2f)",
+		gain, currentPeak, targetPeak)
+
+	// Apply gain
+	normalized := make([]int16, len(samples))
+	for i, sample := range samples {
+		amplified := float64(sample) * gain
+
+		// Clamp to prevent overflow
+		if amplified > 32767 {
+			amplified = 32767
+		} else if amplified < -32768 {
+			amplified = -32768
+		}
+
+		normalized[i] = int16(amplified)
+	}
+
+	return normalized
+}
+
+// ProcessRecording applies all post-processing to a recorded audio file
+func (ap *AudioProcessor) ProcessRecording(filePath string, autoTrim, autoNormalize bool) error {
+	// Read WAV file
+	samples, sampleRate, channels, err := readWAVData(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read WAV: %w", err)
+	}
+
+	log.Printf("Processing recording: %d samples, %d Hz, %d channels",
+		len(samples), sampleRate, channels)
+
+	// Apply silence trimming
+	if autoTrim {
+		samples = ap.TrimSilence(samples, sampleRate, channels)
+	}
+
+	// Apply normalization
+	if autoNormalize {
+		samples = ap.Normalize(samples)
+	}
+
+	// Write processed audio back to file
+	return ap.writeProcessedWAV(filePath, samples, sampleRate, channels)
+}
+
+// writeProcessedWAV writes processed audio data to a WAV file
+func (ap *AudioProcessor) writeProcessedWAV(filePath string, samples []int16, sampleRate, channels int) error {
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	// Write WAV header
+	dataSize := int64(len(samples) * 2) // 2 bytes per sample (int16)
+	if err := writeWAVHeader(file, sampleRate, channels, 16, dataSize); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+
+	// Write sample data
+	for _, sample := range samples {
+		if err := binary.Write(file, binary.LittleEndian, sample); err != nil {
+			return fmt.Errorf("failed to write sample: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// NewClippingDetector creates a new clipping detector
+func NewClippingDetector(threshold float64) *ClippingDetector {
+	return &ClippingDetector{
+		threshold: threshold,
+	}
+}
+
+// Analyze checks samples for clipping
+func (cd *ClippingDetector) Analyze(samples []int16) {
+	for _, sample := range samples {
+		cd.totalSamples++
+		normalized := math.Abs(float64(sample)) / 32768.0
+
+		if normalized >= cd.threshold {
+			cd.isClipping = true
+			cd.clipCount++
+			cd.flashCounter = 20 // Flash for 20 frames
+		}
+	}
+}
+
+// IsClipping returns true if clipping is detected
+func (cd *ClippingDetector) IsClipping() bool {
+	return cd.isClipping && cd.flashCounter > 0
+}
+
+// UpdateFlash updates the flash counter for visual indicator
+func (cd *ClippingDetector) UpdateFlash() {
+	if cd.flashCounter > 0 {
+		cd.flashCounter--
+	}
+	if cd.flashCounter == 0 {
+		cd.isClipping = false
+	}
+}
+
+// GetClipPercentage returns percentage of clipped samples
+func (cd *ClippingDetector) GetClipPercentage() float64 {
+	if cd.totalSamples == 0 {
+		return 0.0
+	}
+	return (float64(cd.clipCount) / float64(cd.totalSamples)) * 100.0
+}
+
+// Reset resets the detector state
+func (cd *ClippingDetector) Reset() {
+	cd.isClipping = false
+	cd.clipCount = 0
+	cd.totalSamples = 0
+	cd.flashCounter = 0
+}
+
+// Helper functions for UI display
+func boolToString(b bool) string {
+	if b {
+		return "ON"
+	}
+	return "OFF"
+}
+
+func renderPeakBar(level float32, width int) string {
+	filled := int(level * float32(width))
+	bar := ""
+
+	for i := 0; i < width; i++ {
+		if i < filled {
+			if level > 0.95 {
+				bar += "█" // Red zone
+			} else if level > 0.8 {
+				bar += "▆" // Yellow zone
+			} else {
+				bar += "▄" // Green zone
+			}
+		} else {
+			bar += "░"
+		}
+	}
+
+	return bar
+}
+
 // Main function
 func main() {
 	setupLogging()
-	// Suppress ALSA stderr spam on Linux so it doesn't leak into the TUI
-	silenceAlsa()
 	log.Printf("Starting voicelog application")
 
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
