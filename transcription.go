@@ -411,12 +411,18 @@ func NewTranscriptionManager(configDir string) *TranscriptionManager {
 	tm.RegisterProvider(NewOpenAIWhisperProvider())
 
 	// Load config
-	tm.LoadConfig()
+	if err := tm.LoadConfig(); err != nil {
+		// Log error but continue with defaults
+		fmt.Printf("Warning: Failed to load transcription config: %v\n", err)
+	}
 
 	// Configure providers from saved config
 	for name, provider := range tm.providers {
 		if providerConfig, ok := tm.config.ProviderConfigs[name]; ok {
-			provider.Configure(providerConfig)
+			if err := provider.Configure(providerConfig); err != nil {
+				// Log error but continue
+				fmt.Printf("Warning: Failed to configure provider %s: %v\n", name, err)
+			}
 		}
 	}
 
